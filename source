@@ -1,0 +1,1052 @@
+-- ============================================================
+--  HELICITY HUB v3 — Rayfield  |  KEYLESS
+--  Game : https://www.roblox.com/games/17759606919/Helicity
+--  New  : Live EF + Wind HUD, Path Prediction, improved all tabs
+-- ============================================================
+
+-- External module (non-blocking)
+task.spawn(function()
+    local ok, err = pcall(function()
+        loadstring(game:HttpGet("https://pastebin.com/raw/gi0GVYRg", true))()
+    end)
+    if not ok then warn("[HelicityHub] Extra module: " .. tostring(err)) end
+end)
+
+-- Rayfield
+local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
+
+-- ── Services ────────────────────────────────────────────────
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TeleportService  = game:GetService("TeleportService")
+local HttpService      = game:GetService("HttpService")
+local Lighting         = game:GetService("Lighting")
+local Workspace        = game:GetService("Workspace")
+local RepStorage       = game:GetService("ReplicatedStorage")
+
+local player   = Players.LocalPlayer
+local camera   = Workspace.CurrentCamera
+local pGui     = player:WaitForChild("PlayerGui")
+
+local function getChar() return player.Character end
+local function getHRP()  local c = getChar(); return c and c:FindFirstChild("HumanoidRootPart") end
+local function getHum()  local c = getChar(); return c and c:FindFirstChildWhichIsA("Humanoid") end
+
+-- ── Tornado state ───────────────────────────────────────────
+local selectedTornado  = nil
+local tornadoList      = {}
+local lagLoopConn      = nil
+local followConn       = nil
+local dodgeConn        = nil
+local freecamEnabled   = false
+local freecamSpeed     = 1
+local freecamConns     = {}
+local allEspHL         = {}
+local espSelHL         = nil
+local predConn         = nil
+local hudConn          = nil
+local DODGE_THRESHOLD  = 40
+local DODGE_RISK       = "Medium"
+
+-- Velocity history for smooth prediction (ring buffer)
+local VEL_SAMPLES      = 20
+local velHistory       = {}
+local lastTorPos       = nil
+
+-- ── Helpers ─────────────────────────────────────────────────
+local function notify(title, content, duration)
+    Rayfield:Notify({ Title = title, Content = content or "", Duration = duration or 4, Image = 4483362458 })
+end
+
+-- Deep-search a tornado model for a named value
+local function findVal(model, ...)
+    if not model then return nil end
+    local keys = {...}
+    for _, v in ipairs(model:GetDescendants()) do
+        local ln = v.Name:lower()
+        for _, k in ipairs(keys) do
+            if ln:find(k:lower()) and v:IsA("ValueBase") then
+                return v
+            end
+        end
+    end
+    return nil
+end
+
+-- Read numeric value safely
+local function readNum(model, ...)
+    local v = findVal(model, ...)
+    return v and tonumber(v.Value) or nil
+end
+
+-- Infer EF rating from wind speed
+local function windToEF(mph)
+    if not mph then return "?" end
+    if mph >= 200 then return "5"
+    elseif mph >= 166 then return "4"
+    elseif mph >= 136 then return "3"
+    elseif mph >= 111 then return "2"
+    elseif mph >= 86  then return "1"
+    else return "0" end
+end
+
+-- Get tornado root part
+local function getTornadoRoot(t)
+    if not t then return nil end
+    return t.PrimaryPart or t:FindFirstChildWhichIsA("BasePart")
+end
+
+-- Collect all tornado models in workspace
+local function getTornadoes()
+    local found = {}
+    for _, obj in ipairs(Workspace:GetDescendants()) do
+        local n = obj.Name:lower()
+        if obj:IsA("Model") and (
+            n:find("tornado") or n:find("vortex") or n:find("funnel") or
+            n:find("wedge")   or n:find("cyclone") or n:find("twister") or
+            (n:find("ef") and not n:find("effect"))
+        ) then
+            -- avoid duplicates (child model inside parent tornado)
+            local skip = false
+            for _, f in ipairs(found) do
+                if obj:IsDescendantOf(f) then skip = true; break end
+            end
+            if not skip then table.insert(found, obj) end
+        end
+    end
+    return found
+end
+
+local function buildTornadoNames()
+    tornadoList = getTornadoes()
+    local names = {"-- None --"}
+    for i, t in ipairs(tornadoList) do
+        names[i + 1] = t.Name .. " [" .. i .. "]"
+    end
+    return names
+end
+
+local function getServerList()
+    local ok, result = pcall(function()
+        return HttpService:JSONDecode(
+            game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?limit=100")
+        )
+    end)
+    if ok and result and result.data then return result.data end
+    return nil
+end
+
+-- Average velocity from ring buffer
+local function avgVelocity()
+    if #velHistory == 0 then return Vector3.zero end
+    local sum = Vector3.zero
+    for _, v in ipairs(velHistory) do sum += v end
+    return sum / #velHistory
+end
+
+-- ════════════════════════════════════════════════════════════
+--  LIVE HUD — always-on-screen tornado info panel
+-- ════════════════════════════════════════════════════════════
+local hudGui = Instance.new("ScreenGui")
+hudGui.Name            = "HelicityHUD"
+hudGui.ResetOnSpawn    = false
+hudGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+hudGui.IgnoreGuiInset  = true
+hudGui.Parent          = pGui
+
+-- Outer frame
+local hudFrame = Instance.new("Frame")
+hudFrame.Name              = "HUD"
+hudFrame.Size              = UDim2.new(0, 230, 0, 158)
+hudFrame.Position          = UDim2.new(1, -246, 0, 70)
+hudFrame.BackgroundColor3  = Color3.fromRGB(5, 10, 20)
+hudFrame.BackgroundTransparency = 0.18
+hudFrame.BorderSizePixel   = 0
+hudFrame.Parent            = hudGui
+
+local hudCorner = Instance.new("UICorner")
+hudCorner.CornerRadius = UDim.new(0, 8)
+hudCorner.Parent       = hudFrame
+
+local hudStroke = Instance.new("UIStroke")
+hudStroke.Color       = Color3.fromRGB(0, 200, 255)
+hudStroke.Thickness   = 1.5
+hudStroke.Transparency = 0.4
+hudStroke.Parent      = hudFrame
+
+-- Title bar
+local hudTitle = Instance.new("TextLabel")
+hudTitle.Size              = UDim2.new(1, 0, 0, 26)
+hudTitle.BackgroundColor3  = Color3.fromRGB(0, 30, 55)
+hudTitle.BackgroundTransparency = 0
+hudTitle.BorderSizePixel   = 0
+hudTitle.Text              = "⚡  TORNADO  HUB"
+hudTitle.Font              = Enum.Font.Code
+hudTitle.TextSize          = 12
+hudTitle.TextColor3        = Color3.fromRGB(0, 220, 255)
+hudTitle.TextXAlignment    = Enum.TextXAlignment.Center
+hudTitle.Parent            = hudFrame
+
+local hudTitleCorner = Instance.new("UICorner")
+hudTitleCorner.CornerRadius = UDim.new(0, 8)
+hudTitleCorner.Parent       = hudTitle
+
+-- Grid of stat cells
+local statDefs = {
+    { key = "EF",     label = "EF RATING",    row = 0 },
+    { key = "WIND",   label = "WIND SPEED",   row = 0 },
+    { key = "DIST",   label = "DISTANCE",     row = 1 },
+    { key = "DIR",    label = "HEADING",      row = 1 },
+    { key = "PRED",   label = "PRED. PATH",   row = 2 },
+    { key = "STATUS", label = "STATUS",       row = 2 },
+}
+local hudCells = {}
+
+for i, def in ipairs(statDefs) do
+    local col = (i - 1) % 2
+    local row = def.row
+
+    local cell = Instance.new("Frame")
+    cell.Size             = UDim2.new(0.5, -4, 0, 38)
+    cell.Position         = UDim2.new(col * 0.5, col == 0 and 3 or 1, 0, 30 + row * 42)
+    cell.BackgroundColor3 = Color3.fromRGB(8, 18, 32)
+    cell.BackgroundTransparency = 0.2
+    cell.BorderSizePixel  = 0
+    cell.Parent           = hudFrame
+    local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0,5); cc.Parent = cell
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size              = UDim2.new(1, 0, 0, 14)
+    lbl.BackgroundTransparency = 1
+    lbl.Text              = def.label
+    lbl.Font              = Enum.Font.Code
+    lbl.TextSize          = 9
+    lbl.TextColor3        = Color3.fromRGB(80, 140, 180)
+    lbl.TextXAlignment    = Enum.TextXAlignment.Center
+    lbl.Parent            = cell
+
+    local val = Instance.new("TextLabel")
+    val.Size              = UDim2.new(1, 0, 0, 22)
+    val.Position          = UDim2.new(0, 0, 0, 14)
+    val.BackgroundTransparency = 1
+    val.Text              = "--"
+    val.Font              = Enum.Font.Code
+    val.TextSize          = 15
+    val.TextColor3        = Color3.fromRGB(0, 220, 255)
+    val.TextXAlignment    = Enum.TextXAlignment.Center
+    val.Parent            = cell
+
+    hudCells[def.key] = val
+end
+
+-- Helper: set a cell value + colour
+local function setHUD(key, text, color)
+    local c = hudCells[key]
+    if not c then return end
+    c.Text = tostring(text)
+    if color then c.TextColor3 = color end
+end
+
+-- EF colour table
+local EF_COLORS = {
+    ["0"] = Color3.fromRGB(100, 220, 100),
+    ["1"] = Color3.fromRGB(200, 220, 50),
+    ["2"] = Color3.fromRGB(255, 180, 0),
+    ["3"] = Color3.fromRGB(255, 120, 0),
+    ["4"] = Color3.fromRGB(255, 50,  0),
+    ["5"] = Color3.fromRGB(255, 0,   0),
+    ["?"] = Color3.fromRGB(150, 150, 150),
+}
+
+-- Compass direction from angle (degrees, 0 = north / +Z)
+local function toCompass(deg)
+    local dirs = {"N","NE","E","SE","S","SW","W","NW","N"}
+    return dirs[math.floor((deg % 360) / 45 + 1.5)]
+end
+
+-- ── World prediction visuals ─────────────────────────────────
+-- Beam using two neon parts + SelectionBox line
+local predEndMarker = Instance.new("Part")
+predEndMarker.Name         = "_PredEnd"
+predEndMarker.Anchored     = true
+predEndMarker.CanCollide   = false
+predEndMarker.Size         = Vector3.new(12, 12, 12)
+predEndMarker.Shape        = Enum.PartType.Ball
+predEndMarker.Material     = Enum.Material.Neon
+predEndMarker.Color        = Color3.fromRGB(255, 50, 0)
+predEndMarker.Transparency = 0.4
+predEndMarker.Position     = Vector3.new(0, -9999, 0)
+predEndMarker.Parent       = Workspace
+
+local predEndBox = Instance.new("SelectionBox")
+predEndBox.Adornee             = predEndMarker
+predEndBox.Color3              = Color3.fromRGB(255, 80, 0)
+predEndBox.LineThickness       = 0.08
+predEndBox.SurfaceTransparency = 0.85
+predEndBox.Parent              = Workspace
+
+-- BillboardGui on the marker
+local predBillboard = Instance.new("BillboardGui")
+predBillboard.Adornee       = predEndMarker
+predBillboard.Size          = UDim2.new(0, 140, 0, 40)
+predBillboard.StudsOffset   = Vector3.new(0, 8, 0)
+predBillboard.AlwaysOnTop   = true
+predBillboard.Parent        = Workspace
+
+local predBillboardLabel = Instance.new("TextLabel")
+predBillboardLabel.Size              = UDim2.new(1, 0, 1, 0)
+predBillboardLabel.BackgroundTransparency = 1
+predBillboardLabel.Text              = "📍 PREDICTED END"
+predBillboardLabel.Font              = Enum.Font.Code
+predBillboardLabel.TextSize          = 13
+predBillboardLabel.TextColor3        = Color3.fromRGB(255, 100, 0)
+predBillboardLabel.TextStrokeTransparency = 0
+predBillboardLabel.Parent            = predBillboard
+
+-- Track segment line (neon beam between current + predicted)
+local function updatePredLine(fromPos, toPos)
+    local existing = Workspace:FindFirstChild("_PredBeam")
+    if existing then existing:Destroy() end
+
+    local mid   = (fromPos + toPos) / 2
+    local dist  = (toPos - fromPos).Magnitude
+    if dist < 1 then return end
+    local dir   = (toPos - fromPos).Unit
+
+    local beam = Instance.new("Part")
+    beam.Name        = "_PredBeam"
+    beam.Anchored    = true
+    beam.CanCollide  = false
+    beam.Material    = Enum.Material.Neon
+    beam.Color       = Color3.fromRGB(255, 80, 0)
+    beam.Transparency = 0.45
+    beam.Size        = Vector3.new(1.5, 1.5, dist)
+    beam.CFrame      = CFrame.new(mid, toPos)
+    beam.Parent      = Workspace
+end
+
+-- ── HUD heartbeat ────────────────────────────────────────────
+hudConn = RunService.Heartbeat:Connect(function()
+    if not selectedTornado then
+        setHUD("EF",     "--",      Color3.fromRGB(100,100,100))
+        setHUD("WIND",   "--",      Color3.fromRGB(100,100,100))
+        setHUD("DIST",   "--",      Color3.fromRGB(100,100,100))
+        setHUD("DIR",    "--",      Color3.fromRGB(100,100,100))
+        setHUD("PRED",   "--",      Color3.fromRGB(100,100,100))
+        setHUD("STATUS", "No tornado", Color3.fromRGB(150,150,150))
+        predEndMarker.Position = Vector3.new(0, -9999, 0)
+        local old = Workspace:FindFirstChild("_PredBeam")
+        if old then old:Destroy() end
+        velHistory = {}; lastTorPos = nil
+        return
+    end
+
+    local root = getTornadoRoot(selectedTornado)
+    if not root then return end
+
+    local torPos = root.Position
+
+    -- Velocity tracking
+    if lastTorPos then
+        local vel = torPos - lastTorPos
+        table.insert(velHistory, vel)
+        if #velHistory > VEL_SAMPLES then table.remove(velHistory, 1) end
+    end
+    lastTorPos = torPos
+
+    -- ── Read EF & wind from model values ──
+    local windMPH = readNum(selectedTornado,
+        "windspeed","wind_speed","wind speed","mph","speed","velocity","ws")
+    local efRaw   = readNum(selectedTornado,
+        "ef","rating","efrating","ef_rating","category","level","intensity")
+
+    -- Fallback: try to read EF from the name itself e.g. "EF3Tornado"
+    if not efRaw then
+        local n = selectedTornado.Name
+        local ef_from_name = n:match("[Ee][Ff](%d)")
+        if ef_from_name then efRaw = tonumber(ef_from_name) end
+    end
+
+    -- Fallback: infer EF from wind
+    local efStr = efRaw and tostring(math.floor(efRaw)) or windToEF(windMPH)
+
+    -- Wind fallback from EF rating
+    if not windMPH and efRaw then
+        local efWindMap = {[0]=73,[1]=112,[2]=157,[3]=206,[4]=260,[5]=999}
+        windMPH = efWindMap[math.floor(efRaw)] or nil
+    end
+
+    -- Display EF
+    local efColor = EF_COLORS[efStr] or EF_COLORS["?"]
+    setHUD("EF", "EF" .. efStr, efColor)
+
+    -- Display wind
+    if windMPH then
+        setHUD("WIND", math.floor(windMPH) .. " mph", efColor)
+    else
+        setHUD("WIND", "~" .. (efStr ~= "?" and tostring(
+            ({["0"]=73,["1"]=112,["2"]=157,["3"]=206,["4"]=260,["5"]=318})[efStr] or 0
+        ) .. " mph" or "--"), efColor)
+    end
+
+    -- Distance & heading from player
+    local hrp = getHRP()
+    if hrp then
+        local dist = (hrp.Position - torPos).Magnitude
+        setHUD("DIST", math.floor(dist) .. " st", Color3.fromRGB(0, 220, 255))
+
+        local flat = Vector3.new(torPos.X - hrp.Position.X, 0, torPos.Z - hrp.Position.Z)
+        local deg  = math.deg(math.atan2(flat.X, flat.Z)) % 360
+        setHUD("DIR", toCompass(deg) .. "  " .. math.floor(deg) .. "°", Color3.fromRGB(0, 220, 255))
+    end
+
+    -- ── Path prediction ──────────────────────────────────────
+    local avgVel = avgVelocity()
+    local predSeconds = 30   -- predict 30 seconds ahead
+    local Hz = 60            -- approximate heartbeat rate
+    local predOffset = avgVel * (predSeconds * Hz)
+    local predPos    = torPos + predOffset
+
+    -- Snap to ground level (Y = ~5)
+    predPos = Vector3.new(predPos.X, 5, predPos.Z)
+
+    predEndMarker.Position = predPos
+    updatePredLine(torPos, predPos)
+
+    local predDist = math.floor((predPos - torPos).Magnitude)
+    local predDir  = avgVel.Magnitude > 0.001
+        and toCompass(math.deg(math.atan2(avgVel.X, avgVel.Z)) % 360)
+        or  "---"
+    setHUD("PRED", predDir .. "  " .. predDist .. " st", Color3.fromRGB(255, 140, 0))
+
+    -- Status
+    local statusStr, statusColor
+    local distToPlayer = hrp and (hrp.Position - torPos).Magnitude or math.huge
+    if distToPlayer < 40 then
+        statusStr   = "⚠ DANGER"
+        statusColor = Color3.fromRGB(255, 30, 30)
+    elseif distToPlayer < 120 then
+        statusStr   = "⚡ CLOSE"
+        statusColor = Color3.fromRGB(255, 160, 0)
+    else
+        statusStr   = "✔ SAFE"
+        statusColor = Color3.fromRGB(60, 220, 100)
+    end
+    setHUD("STATUS", statusStr, statusColor)
+end)
+
+-- ════════════════════════════════════════════════════════════
+--  RAYFIELD WINDOW
+-- ════════════════════════════════════════════════════════════
+local Window = Rayfield:CreateWindow({
+    Name            = "Helicity Hub  v3",
+    Icon            = 0,
+    LoadingTitle    = "Helicity Hub",
+    LoadingSubtitle = "Keyless  •  No Key Required",
+    Theme           = "Default",
+    DisableRayfieldPrompts = false,
+    DisableBuildWarnings   = true,
+    ConfigurationSaving = {
+        Enabled    = true,
+        FolderName = "HelicityHub",
+        FileName   = "Config",
+    },
+    KeySystem = false,   -- KEYLESS
+})
+
+-- ════════════════════════════════════════════════════════════
+--  TAB 1 — SERVER
+-- ════════════════════════════════════════════════════════════
+local ServerTab = Window:CreateTab("Server", 4483362458)
+
+ServerTab:CreateSection("Anti-Lag")
+
+ServerTab:CreateButton({
+    Name     = "Anti-Lag Sweep",
+    Callback = function()
+        local n = 0
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            if obj:IsA("ParticleEmitter") or obj:IsA("Smoke") or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                obj.Enabled = false; n += 1
+            end
+        end
+        notify("Anti-Lag Sweep", "Disabled " .. n .. " effects.")
+    end,
+})
+
+local lagLoopRunning = false
+ServerTab:CreateToggle({
+    Name         = "Anti-Lag Loop",
+    CurrentValue = false,
+    Flag         = "AntiLagLoop",
+    Callback     = function(val)
+        lagLoopRunning = val
+        if lagLoopConn then lagLoopConn:Disconnect(); lagLoopConn = nil end
+        if not val then notify("Anti-Lag Loop", "Stopped."); return end
+        lagLoopConn = RunService.Heartbeat:Connect(function()
+            if not lagLoopRunning then lagLoopConn:Disconnect(); return end
+            for _, obj in ipairs(Workspace:GetDescendants()) do
+                if obj:IsA("ParticleEmitter") or obj:IsA("Smoke") or obj:IsA("Fire") or obj:IsA("Sparkles") then
+                    obj.Enabled = false
+                end
+            end
+        end)
+        notify("Anti-Lag Loop", "Running.")
+    end,
+})
+
+ServerTab:CreateSection("Server")
+
+ServerTab:CreateButton({
+    Name = "Rejoin",
+    Callback = function() TeleportService:Teleport(game.PlaceId, player) end,
+})
+
+ServerTab:CreateButton({
+    Name     = "Serverhop — Big Server",
+    Callback = function()
+        notify("Serverhopping", "Finding biggest server...")
+        task.spawn(function()
+            local data = getServerList()
+            if not data then notify("Error", "Couldn't fetch server list."); return end
+            local best, bp = nil, 0
+            for _, s in ipairs(data) do
+                if s.playing and s.playing > bp and s.id ~= game.JobId then best = s; bp = s.playing end
+            end
+            if best then TeleportService:TeleportToPlaceInstance(game.PlaceId, best.id, player)
+            else notify("Serverhop", "No larger server found.") end
+        end)
+    end,
+})
+
+ServerTab:CreateButton({
+    Name     = "Serverhop — Small Server",
+    Callback = function()
+        notify("Serverhopping", "Finding smallest server...")
+        task.spawn(function()
+            local data = getServerList()
+            if not data then notify("Error", "Couldn't fetch server list."); return end
+            local best, bp = nil, math.huge
+            for _, s in ipairs(data) do
+                if s.playing and s.playing < bp and s.id ~= game.JobId then best = s; bp = s.playing end
+            end
+            if best then TeleportService:TeleportToPlaceInstance(game.PlaceId, best.id, player)
+            else notify("Serverhop", "No smaller server found.") end
+        end)
+    end,
+})
+
+-- ════════════════════════════════════════════════════════════
+--  TAB 2 — TORNADO
+-- ════════════════════════════════════════════════════════════
+local TornadoTab = Window:CreateTab("Tornado", 4483362458)
+
+TornadoTab:CreateSection("Select")
+
+local tornadoDropdown = TornadoTab:CreateDropdown({
+    Name          = "Select Tornado",
+    Options       = buildTornadoNames(),
+    CurrentOption = {"-- None --"},
+    Flag          = "SelectedTornado",
+    Callback      = function(opts)
+        local chosen = type(opts) == "table" and opts[1] or opts
+        if chosen == "-- None --" then
+            selectedTornado = nil; velHistory = {}; lastTorPos = nil; return
+        end
+        local idx = tonumber(chosen:match("%[(%d+)%]"))
+        if idx then selectedTornado = tornadoList[idx]; velHistory = {}; lastTorPos = nil end
+        if selectedTornado then notify("Selected", selectedTornado.Name) end
+    end,
+})
+
+TornadoTab:CreateButton({
+    Name     = "🔄 Refresh Tornado List",
+    Callback = function()
+        local names = buildTornadoNames()
+        tornadoDropdown:Set("-- None --")
+        selectedTornado = nil; velHistory = {}; lastTorPos = nil
+        notify("Refreshed", "Found " .. (#names - 1) .. " tornado(s).")
+    end,
+})
+
+TornadoTab:CreateSection("Tracking")
+
+TornadoTab:CreateButton({
+    Name     = "Teleport to Selected Tornado",
+    Callback = function()
+        local root = getTornadoRoot(selectedTornado)
+        local hrp  = getHRP()
+        if not root or not hrp then notify("Error", "No tornado selected."); return end
+        hrp.CFrame = root.CFrame * CFrame.new(0, 5, 45)
+        notify("Teleported", "Sent to " .. selectedTornado.Name)
+    end,
+})
+
+local following = false
+TornadoTab:CreateToggle({
+    Name         = "Follow Selected Tornado",
+    CurrentValue = false,
+    Flag         = "Follow",
+    Callback     = function(val)
+        following = val
+        if followConn then followConn:Disconnect(); followConn = nil end
+        if not val then return end
+        followConn = RunService.Heartbeat:Connect(function()
+            if not following then followConn:Disconnect(); return end
+            local root = getTornadoRoot(selectedTornado)
+            local hrp  = getHRP()
+            if root and hrp then hrp.CFrame = root.CFrame * CFrame.new(0, 5, 45) end
+        end)
+    end,
+})
+
+TornadoTab:CreateSection("Auto Dodge")
+
+local dodging = false
+TornadoTab:CreateToggle({
+    Name         = "Auto Dodge Selected Tornado",
+    CurrentValue = false,
+    Flag         = "AutoDodge",
+    Callback     = function(val)
+        dodging = val
+        if dodgeConn then dodgeConn:Disconnect(); dodgeConn = nil end
+        if not val then notify("Auto Dodge", "Disabled."); return end
+        dodgeConn = RunService.Heartbeat:Connect(function()
+            if not dodging then dodgeConn:Disconnect(); return end
+            local root = getTornadoRoot(selectedTornado)
+            local hrp  = getHRP()
+            if not root or not hrp then return end
+            local dist = (hrp.Position - root.Position).Magnitude
+            if dist < DODGE_THRESHOLD then
+                local safe = DODGE_RISK == "Aggressive" and 100
+                          or DODGE_RISK == "Medium"     and 65
+                          or 45
+                local away = (hrp.Position - root.Position).Unit
+                hrp.CFrame = CFrame.new(root.Position + away * safe + Vector3.new(0, 5, 0))
+            end
+        end)
+        notify("Auto Dodge", "Active  |  Threshold: " .. DODGE_THRESHOLD .. "st  |  " .. DODGE_RISK)
+    end,
+})
+
+TornadoTab:CreateSlider({
+    Name         = "Dodge Threshold",
+    Range        = {15, 250},
+    Increment    = 5,
+    Suffix       = " studs",
+    CurrentValue = 40,
+    Flag         = "DodgeThresh",
+    Callback     = function(v) DODGE_THRESHOLD = v end,
+})
+
+TornadoTab:CreateDropdown({
+    Name          = "Risk Level",
+    Options       = {"Conservative", "Medium", "Aggressive"},
+    CurrentOption = {"Medium"},
+    Flag          = "DodgeRisk",
+    Callback      = function(opts) DODGE_RISK = type(opts) == "table" and opts[1] or opts end,
+})
+
+TornadoTab:CreateSection("Modify")
+
+TornadoTab:CreateButton({
+    Name     = "Delete Sirens",
+    Callback = function()
+        local n = 0
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            local ln = obj.Name:lower()
+            if ln:find("siren") or ln:find("alarm") or ln:find("alert") then
+                obj:Destroy(); n += 1
+            end
+        end
+        notify("Sirens", "Removed " .. n .. " siren(s).")
+    end,
+})
+
+TornadoTab:CreateButton({
+    Name     = "Wind Override (Selected)",
+    Callback = function()
+        if not selectedTornado then notify("Error", "Select a tornado first."); return end
+        local done = false
+        for _, v in ipairs(selectedTornado:GetDescendants()) do
+            if v:IsA("ValueBase") and v.Name:lower():find("wind") then
+                pcall(function() v.Value = 999 end); done = true
+            end
+        end
+        notify("Wind Override", done and "Set wind to 999!" or "No wind value found.")
+    end,
+})
+
+TornadoTab:CreateSlider({
+    Name         = "Set MPH (Selected)",
+    Range        = {50, 1000},
+    Increment    = 10,
+    Suffix       = " mph",
+    CurrentValue = 200,
+    Flag         = "SetMPH",
+    Callback     = function(val)
+        if not selectedTornado then return end
+        for _, v in ipairs(selectedTornado:GetDescendants()) do
+            if v:IsA("ValueBase") then
+                local ln = v.Name:lower()
+                if ln:find("speed") or ln:find("mph") or ln:find("wind") then
+                    pcall(function() v.Value = val end)
+                end
+            end
+        end
+    end,
+})
+
+-- ════════════════════════════════════════════════════════════
+--  TAB 3 — ESP / VISUALS
+-- ════════════════════════════════════════════════════════════
+local VisualTab = Window:CreateTab("ESP / Visuals", 4483362458)
+
+VisualTab:CreateSection("HUD")
+
+VisualTab:CreateToggle({
+    Name         = "Show Tornado HUD",
+    CurrentValue = true,
+    Flag         = "ShowHUD",
+    Callback     = function(val) hudFrame.Visible = val end,
+})
+
+VisualTab:CreateSection("Tornado ESP")
+
+VisualTab:CreateToggle({
+    Name         = "Tornado ESP (Selected)",
+    CurrentValue = false,
+    Flag         = "ESPSel",
+    Callback     = function(val)
+        if espSelHL then espSelHL:Destroy(); espSelHL = nil end
+        if not val then return end
+        if not selectedTornado then notify("ESP", "Select a tornado first."); return end
+        espSelHL = Instance.new("Highlight")
+        espSelHL.Adornee             = selectedTornado
+        espSelHL.FillColor           = Color3.fromRGB(255, 140, 0)
+        espSelHL.OutlineColor        = Color3.fromRGB(255, 220, 0)
+        espSelHL.FillTransparency    = 0.35
+        espSelHL.OutlineTransparency = 0
+        espSelHL.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
+        espSelHL.Parent              = selectedTornado
+    end,
+})
+
+VisualTab:CreateButton({
+    Name     = "ESP — All Tornados",
+    Callback = function()
+        for _, h in pairs(allEspHL) do pcall(function() h:Destroy() end) end
+        allEspHL = {}
+        local list = getTornadoes()
+        for _, t in ipairs(list) do
+            local hl = Instance.new("Highlight")
+            hl.Adornee             = t
+            hl.FillColor           = Color3.fromRGB(0, 180, 255)
+            hl.OutlineColor        = Color3.fromRGB(0, 255, 255)
+            hl.FillTransparency    = 0.35
+            hl.OutlineTransparency = 0
+            hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
+            hl.Parent              = t
+            table.insert(allEspHL, hl)
+        end
+        notify("Tornado ESP", "Highlighted " .. #list .. " tornado(s).")
+    end,
+})
+
+VisualTab:CreateButton({
+    Name     = "Clear All Tornado ESP",
+    Callback = function()
+        for _, h in pairs(allEspHL) do pcall(function() h:Destroy() end) end
+        allEspHL = {}
+        if espSelHL then espSelHL:Destroy(); espSelHL = nil end
+        notify("ESP", "Cleared all highlights.")
+    end,
+})
+
+VisualTab:CreateToggle({
+    Name         = "Probe ESP",
+    CurrentValue = false,
+    Flag         = "ProbeESP",
+    Callback     = function(val)
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            local ln = obj.Name:lower()
+            if ln:find("probe") or ln:find("sensor") then
+                local target = obj:IsA("Model") and obj or obj.Parent
+                if val then
+                    if not target:FindFirstChildWhichIsA("Highlight") then
+                        local hl = Instance.new("Highlight")
+                        hl.Adornee = target
+                        hl.FillColor           = Color3.fromRGB(0, 255, 100)
+                        hl.OutlineColor        = Color3.fromRGB(255, 255, 255)
+                        hl.FillTransparency    = 0.3
+                        hl.OutlineTransparency = 0
+                        hl.DepthMode           = Enum.HighlightDepthMode.AlwaysOnTop
+                        hl.Parent              = target
+                    end
+                else
+                    local e = target:FindFirstChildWhichIsA("Highlight")
+                    if e then e:Destroy() end
+                end
+            end
+        end
+    end,
+})
+
+VisualTab:CreateSection("World")
+
+VisualTab:CreateToggle({
+    Name         = "Fullbright",
+    CurrentValue = false,
+    Flag         = "Fullbright",
+    Callback     = function(val)
+        Lighting.Brightness     = val and 5  or 2
+        Lighting.Ambient        = val and Color3.fromRGB(255,255,255) or Color3.fromRGB(127,127,127)
+        Lighting.OutdoorAmbient = val and Color3.fromRGB(255,255,255) or Color3.fromRGB(127,127,127)
+        if val then Lighting.ClockTime = 14 end
+        for _, fx in ipairs(Lighting:GetChildren()) do
+            if fx:IsA("BlurEffect") or fx:IsA("ColorCorrectionEffect") or
+               fx:IsA("DepthOfFieldEffect") or fx:IsA("SunRaysEffect") then
+                fx.Enabled = not val
+            end
+        end
+    end,
+})
+
+VisualTab:CreateToggle({
+    Name         = "Remove Fog",
+    CurrentValue = false,
+    Flag         = "RemoveFog",
+    Callback     = function(val)
+        Lighting.FogEnd   = val and 1e9 or 1000
+        Lighting.FogStart = val and 1e9 or 0
+    end,
+})
+
+VisualTab:CreateButton({
+    Name     = "Remove Rain",
+    Callback = function()
+        local n, kws = 0, {"rain","precipitation","drizzle","hail","weather"}
+        for _, obj in ipairs(Workspace:GetDescendants()) do
+            for _, kw in ipairs(kws) do
+                if obj.Name:lower():find(kw) then
+                    if obj:IsA("ParticleEmitter") or obj:IsA("Smoke") then obj.Enabled = false; n+=1; break
+                    elseif obj:IsA("Folder") or obj:IsA("Model") then obj:Destroy(); n+=1; break end
+                end
+            end
+        end
+        notify("Rain", "Removed " .. n .. " rain object(s).")
+    end,
+})
+
+-- ════════════════════════════════════════════════════════════
+--  TAB 4 — PLAYER
+-- ════════════════════════════════════════════════════════════
+local PlayerTab = Window:CreateTab("Player", 4483362458)
+
+PlayerTab:CreateSection("Movement")
+
+PlayerTab:CreateToggle({
+    Name = "WalkSpeed Hack", CurrentValue = false, Flag = "SpeedHack",
+    Callback = function(val) local h = getHum(); if h then h.WalkSpeed = val and 100 or 16 end end,
+})
+
+PlayerTab:CreateSlider({
+    Name = "Walk Speed", Range = {16,500}, Increment = 2, Suffix = " stud/s",
+    CurrentValue = 16, Flag = "WalkSpeed",
+    Callback = function(val) local h = getHum(); if h then h.WalkSpeed = val end end,
+})
+
+PlayerTab:CreateSlider({
+    Name = "Jump Power", Range = {50,600}, Increment = 10, Suffix = "",
+    CurrentValue = 50, Flag = "JumpPower",
+    Callback = function(val) local h = getHum(); if h then h.JumpPower = val end end,
+})
+
+local infJump = false
+PlayerTab:CreateToggle({
+    Name = "Infinite Jump", CurrentValue = false, Flag = "InfJump",
+    Callback = function(val) infJump = val end,
+})
+UserInputService.JumpRequest:Connect(function()
+    if infJump then local h = getHum(); if h then h:ChangeState(Enum.HumanoidStateType.Jumping) end end
+end)
+
+local noclip = false
+PlayerTab:CreateToggle({
+    Name = "Noclip", CurrentValue = false, Flag = "Noclip",
+    Callback = function(val)
+        noclip = val
+        if not val then
+            local c = getChar()
+            if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") then p.CanCollide = true end end end
+        end
+    end,
+})
+RunService.Stepped:Connect(function()
+    if not noclip then return end
+    local c = getChar()
+    if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") then p.CanCollide = false end end end
+end)
+
+PlayerTab:CreateToggle({
+    Name = "Anchor Player", CurrentValue = false, Flag = "Anchor",
+    Callback = function(val)
+        local hrp = getHRP(); if hrp then hrp.Anchored = val end
+        notify("Anchor", val and "Anchored." or "Unanchored.")
+    end,
+})
+
+local antiVoid = false
+PlayerTab:CreateToggle({
+    Name = "Anti-Void", CurrentValue = false, Flag = "AntiVoid",
+    Callback = function(val) antiVoid = val end,
+})
+RunService.Heartbeat:Connect(function()
+    if antiVoid then local hrp = getHRP(); if hrp and hrp.Position.Y < -200 then hrp.CFrame = CFrame.new(0, 100, 0) end end
+end)
+
+PlayerTab:CreateSection("Teleport")
+
+local TOWNS = {
+    {name="Spawn",      pos=Vector3.new(0,10,0)},
+    {name="East Town",  pos=Vector3.new(800,10,0)},
+    {name="West Town",  pos=Vector3.new(-800,10,0)},
+    {name="North Town", pos=Vector3.new(0,10,-800)},
+    {name="South Town", pos=Vector3.new(0,10,800)},
+    {name="Outskirts",  pos=Vector3.new(1200,10,1200)},
+}
+local townMap, townNames = {}, {}
+for _, t in ipairs(TOWNS) do townMap[t.name] = t.pos; table.insert(townNames, t.name) end
+
+local selTown = townNames[1]
+PlayerTab:CreateDropdown({
+    Name="Town", Options=townNames, CurrentOption={townNames[1]}, Flag="Town",
+    Callback = function(opts) selTown = type(opts)=="table" and opts[1] or opts end,
+})
+
+PlayerTab:CreateButton({
+    Name = "Teleport to Selected Town",
+    Callback = function()
+        local pos = townMap[selTown]; local hrp = getHRP()
+        if hrp and pos then hrp.CFrame = CFrame.new(pos); notify("Teleported", selTown) end
+    end,
+})
+
+-- ════════════════════════════════════════════════════════════
+--  TAB 5 — FREECAM
+-- ════════════════════════════════════════════════════════════
+local FreecamTab = Window:CreateTab("Freecam", 4483362458)
+FreecamTab:CreateSection("WASD + Mouse  •  Space/Shift  •  J to toggle")
+
+local freecamPart = nil
+
+local function enableFreecam()
+    local c = getChar()
+    if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") then p.LocalTransparencyModifier = 1 end end end
+    freecamPart = Instance.new("Part")
+    freecamPart.Anchored = true; freecamPart.CanCollide = false
+    freecamPart.Transparency = 1; freecamPart.Size = Vector3.new(1,1,1)
+    freecamPart.CFrame = camera.CFrame; freecamPart.Parent = Workspace
+    camera.CameraType = Enum.CameraType.Scriptable; camera.CameraSubject = nil
+
+    freecamConns[#freecamConns+1] = RunService.RenderStepped:Connect(function(dt)
+        if not freecamEnabled then return end
+        local spd = freecamSpeed * 60 * dt
+        local cf = camera.CFrame; local mv = Vector3.zero
+        if UserInputService:IsKeyDown(Enum.KeyCode.W)         then mv += cf.LookVector  end
+        if UserInputService:IsKeyDown(Enum.KeyCode.S)         then mv -= cf.LookVector  end
+        if UserInputService:IsKeyDown(Enum.KeyCode.A)         then mv -= cf.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.D)         then mv += cf.RightVector end
+        if UserInputService:IsKeyDown(Enum.KeyCode.Space)     then mv += Vector3.yAxis  end
+        if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then mv -= Vector3.yAxis  end
+        if mv.Magnitude > 0 then freecamPart.CFrame = freecamPart.CFrame + mv.Unit * spd end
+        camera.CFrame = CFrame.new(freecamPart.Position, freecamPart.Position + cf.LookVector)
+    end)
+
+    freecamConns[#freecamConns+1] = UserInputService.InputChanged:Connect(function(input)
+        if not freecamEnabled then return end
+        if input.UserInputType == Enum.UserInputType.MouseMovement then
+            local dx, dy = input.Delta.X * 0.004, input.Delta.Y * 0.004
+            local cf = camera.CFrame
+            camera.CFrame = CFrame.new(cf.Position) * CFrame.Angles(0,-dx,0) * CFrame.Angles(-dy,0,0)
+            freecamPart.CFrame = camera.CFrame
+        end
+    end)
+end
+
+local function disableFreecam()
+    for _, c in ipairs(freecamConns) do pcall(function() c:Disconnect() end) end
+    freecamConns = {}
+    if freecamPart then freecamPart:Destroy(); freecamPart = nil end
+    camera.CameraType = Enum.CameraType.Custom; camera.CameraSubject = getHum()
+    local c = getChar()
+    if c then for _, p in ipairs(c:GetDescendants()) do if p:IsA("BasePart") then p.LocalTransparencyModifier = 0 end end end
+end
+
+FreecamTab:CreateToggle({
+    Name="Enable Freecam  [J]", CurrentValue=false, Flag="Freecam",
+    Callback=function(val) freecamEnabled=val; if val then enableFreecam() else disableFreecam() end end,
+})
+FreecamTab:CreateSlider({
+    Name="Freecam Speed", Range={1,30}, Increment=1, Suffix="x",
+    CurrentValue=1, Flag="FreecamSpd",
+    Callback=function(val) freecamSpeed=val end,
+})
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.J then
+        freecamEnabled = not freecamEnabled
+        if freecamEnabled then enableFreecam() else disableFreecam() end
+    end
+end)
+
+-- ════════════════════════════════════════════════════════════
+--  TAB 6 — SETTINGS
+-- ════════════════════════════════════════════════════════════
+local SettingsTab = Window:CreateTab("Settings", 4483362458)
+
+SettingsTab:CreateSection("Config")
+
+SettingsTab:CreateButton({
+    Name = "Save Config",
+    Callback = function() Rayfield:SaveConfiguration(); notify("Config", "Saved.") end,
+})
+SettingsTab:CreateButton({
+    Name = "Load Config",
+    Callback = function() Rayfield:LoadConfiguration(); notify("Config", "Loaded.") end,
+})
+
+SettingsTab:CreateSection("Extra Module")
+
+SettingsTab:CreateButton({
+    Name = "Reload Extra Module",
+    Callback = function()
+        local ok2, e2 = pcall(function() loadstring(game:HttpGet("https://pastebin.com/raw/gi0GVYRg", true))() end)
+        notify("Extra Module", ok2 and "Reloaded!" or "Failed: " .. tostring(e2))
+    end,
+})
+
+SettingsTab:CreateSection("Danger Zone")
+
+SettingsTab:CreateButton({
+    Name = "💀 Unload Script",
+    Callback = function()
+        if lagLoopConn then lagLoopConn:Disconnect() end
+        if followConn  then followConn:Disconnect()  end
+        if dodgeConn   then dodgeConn:Disconnect()   end
+        if hudConn     then hudConn:Disconnect()     end
+        if freecamEnabled then disableFreecam() end
+        for _, h in pairs(allEspHL) do pcall(function() h:Destroy() end) end
+        if espSelHL then espSelHL:Destroy() end
+        predEndMarker:Destroy(); predEndBox:Destroy(); predBillboard:Destroy()
+        local b = Workspace:FindFirstChild("_PredBeam"); if b then b:Destroy() end
+        hudGui:Destroy()
+        Lighting.FogEnd = 1000; Lighting.FogStart = 0; Lighting.Brightness = 2
+        Rayfield:Destroy()
+    end,
+})
+
+-- ── Boot ─────────────────────────────────────────────────────
+Rayfield:LoadConfiguration()
+notify("Helicity Hub v3", "Keyless ✔  |  Select a tornado to start  |  J = freecam", 6)
