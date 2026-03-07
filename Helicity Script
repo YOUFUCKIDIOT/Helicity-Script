@@ -158,7 +158,7 @@ hudGui.Parent          = pGui
 -- Outer frame
 local hudFrame = Instance.new("Frame")
 hudFrame.Name              = "HUD"
-hudFrame.Size              = UDim2.new(0, 230, 0, 158)
+hudFrame.Size              = UDim2.new(0, 230, 0, 202)
 hudFrame.Position          = UDim2.new(1, -246, 0, 70)
 hudFrame.BackgroundColor3  = Color3.fromRGB(5, 10, 20)
 hudFrame.BackgroundTransparency = 0.18
@@ -200,6 +200,7 @@ local statDefs = {
     { key = "DIR",    label = "HEADING",      row = 1 },
     { key = "PRED",   label = "PRED. PATH",   row = 2 },
     { key = "STATUS", label = "STATUS",       row = 2 },
+    { key = "SAVE",   label = "SAVE?",        row = 3 },
 }
 local hudCells = {}
 
@@ -208,8 +209,14 @@ for i, def in ipairs(statDefs) do
     local row = def.row
 
     local cell = Instance.new("Frame")
-    cell.Size             = UDim2.new(0.5, -4, 0, 38)
-    cell.Position         = UDim2.new(col * 0.5, col == 0 and 3 or 1, 0, 30 + row * 42)
+    -- SAVE row spans full width
+    if def.key == "SAVE" then
+        cell.Size     = UDim2.new(1, -6, 0, 38)
+        cell.Position = UDim2.new(0, 3, 0, 30 + row * 42)
+    else
+        cell.Size     = UDim2.new(0.5, -4, 0, 38)
+        cell.Position = UDim2.new(col * 0.5, col == 0 and 3 or 1, 0, 30 + row * 42)
+    end
     cell.BackgroundColor3 = Color3.fromRGB(8, 18, 32)
     cell.BackgroundTransparency = 0.2
     cell.BorderSizePixel  = 0
@@ -335,6 +342,14 @@ hudConn = RunService.Heartbeat:Connect(function()
         setHUD("DIR",    "--",      Color3.fromRGB(100,100,100))
         setHUD("PRED",   "--",      Color3.fromRGB(100,100,100))
         setHUD("STATUS", "No tornado", Color3.fromRGB(150,150,150))
+        local sc = hudCells["SAVE"]
+        if sc then
+            sc.Text = "-- Select a tornado --"
+            sc.TextColor3 = Color3.fromRGB(120,120,120)
+            sc.TextSize = 12
+            local p = sc.Parent
+            if p and p:IsA("Frame") then p.BackgroundColor3 = Color3.fromRGB(8,18,32) end
+        end
         predEndMarker.Position = Vector3.new(0, -9999, 0)
         local old = Workspace:FindFirstChild("_PredBeam")
         if old then old:Destroy() end
@@ -430,10 +445,55 @@ hudConn = RunService.Heartbeat:Connect(function()
         statusStr   = "⚡ CLOSE"
         statusColor = Color3.fromRGB(255, 160, 0)
     else
-        statusStr   = "✔ SAFE"
+        statusStr   = "✔ CLEAR"
         statusColor = Color3.fromRGB(60, 220, 100)
     end
     setHUD("STATUS", statusStr, statusColor)
+
+    -- ── SAVE verdict ─────────────────────────────────────────
+    -- Uses wind MPH + EF rating + distance to decide if you should stay
+    --   NOT SAVE = EF3+ (136+ mph) OR very close  → too dangerous
+    --   MARGINAL  = EF2 (111–135 mph) OR close     → risky, your call
+    --   SAVE      = EF0-1 (<111 mph) AND far enough → safe to stay/chase
+    local mph     = windMPH or 0
+    local efNum   = tonumber(efStr) or 0
+    local saveStr, saveColor, saveBg
+
+    if efNum >= 3 or mph >= 136 then
+        -- EF3 / EF4 / EF5 — violent, evacuate
+        saveStr   = "✖  NOT SAVE  (EF" .. efStr .. " — " .. math.floor(mph) .. " mph)"
+        saveColor = Color3.fromRGB(255, 30, 30)
+        saveBg    = Color3.fromRGB(60, 5, 5)
+    elseif efNum == 2 or mph >= 111 then
+        -- EF2 — significant, marginal
+        saveStr   = "⚡  MARGINAL  (EF" .. efStr .. " — " .. math.floor(mph) .. " mph)"
+        saveColor = Color3.fromRGB(255, 160, 0)
+        saveBg    = Color3.fromRGB(45, 25, 0)
+    else
+        -- EF0 / EF1 — relatively weak
+        saveStr   = "✔  SAVE  (EF" .. efStr .. " — " .. math.floor(mph) .. " mph)"
+        saveColor = Color3.fromRGB(60, 220, 100)
+        saveBg    = Color3.fromRGB(5, 35, 10)
+    end
+
+    -- Also override to NOT SAVE if player is dangerously close regardless of EF
+    if distToPlayer < 40 then
+        saveStr   = "✖  NOT SAVE  (TOO CLOSE)"
+        saveColor = Color3.fromRGB(255, 30, 30)
+        saveBg    = Color3.fromRGB(60, 5, 5)
+    end
+
+    local saveCell = hudCells["SAVE"]
+    if saveCell then
+        saveCell.Text       = saveStr
+        saveCell.TextColor3 = saveColor
+        saveCell.TextSize   = 12
+        -- tint the parent frame background
+        local parent = saveCell.Parent
+        if parent and parent:IsA("Frame") then
+            parent.BackgroundColor3 = saveBg
+        end
+    end
 end)
 
 -- ════════════════════════════════════════════════════════════
