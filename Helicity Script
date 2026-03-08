@@ -654,12 +654,19 @@ ST:CreateToggle({Name="Anti-Lag Loop",CurrentValue=false,Flag="AntiLagLoop",Call
     lagRunning=v
     if lagConn then lagConn:Disconnect(); lagConn=nil end
     if not v then return end
+    -- Throttled: runs every 2 seconds, NOT every frame
+    -- Running GetDescendants() every frame is itself a major cause of lag
     lagConn=RunService.Heartbeat:Connect(function()
         if not lagRunning then lagConn:Disconnect(); lagConn=nil; return end
-        for _,o in ipairs(Workspace:GetDescendants()) do
-            if o:IsA("ParticleEmitter") or o:IsA("Smoke") or o:IsA("Fire") or o:IsA("Sparkles") then
-                o.Enabled=false
+    end)
+    task.spawn(function()
+        while lagRunning do
+            for _,o in ipairs(Workspace:GetDescendants()) do
+                if o:IsA("ParticleEmitter") or o:IsA("Smoke") or o:IsA("Fire") or o:IsA("Sparkles") then
+                    o.Enabled=false
+                end
             end
+            task.wait(2) -- every 2 seconds is enough, not every frame
         end
     end)
 end})
@@ -738,12 +745,14 @@ end})
 local TT=Window:CreateTab("Tornado",4483362458)
 
 TT:CreateSection("Select")
+
+-- Dropdown starts empty — tornado scan runs AFTER window loads to avoid startup freeze
 local torDD=TT:CreateDropdown({
-    Name="Select Tornado",Options=buildTornadoNames(),
+    Name="Select Tornado",Options={"-- None --"},
     CurrentOption={"-- None --"},Flag="SelTornado",
     Callback=function(opts)
         local c=type(opts)=="table" and opts[1] or opts
-        if c=="-- None --" then
+        if c=="-- None --" or c=="Scanning..." then
             selectedTornado=nil; velBuf={}; velBufIdx=0; velBufCount=0; lastTorPos=nil
             cachedWind=nil; cachedEFStr="?"; cachedEFNum=0; lastScan=0; return
         end
@@ -757,10 +766,20 @@ local torDD=TT:CreateDropdown({
     end,
 })
 
-TT:CreateButton({Name="🔄 Refresh List",Callback=function()
-    buildTornadoNames(); torDD:Set("-- None --")
+-- Scan runs off main thread — called after window fully built
+local function doTornadoScan(silent)
+    task.wait() -- yield one frame so UI stays smooth
+    local names = buildTornadoNames()
+    pcall(function() torDD:Refresh(names, true) end)
+    pcall(function() torDD:Set("-- None --") end)
     selectedTornado=nil; velBuf={}; velBufIdx=0; velBufCount=0; lastTorPos=nil
-    notify("Refreshed","Found "..#tornadoList.." tornado(s).")
+    if not silent then
+        notify("Tornado List","Found "..#tornadoList.." tornado(s).",3)
+    end
+end
+
+TT:CreateButton({Name="🔄 Refresh List",Callback=function()
+    task.spawn(doTornadoScan, false)
 end})
 
 TT:CreateSection("Tracking")
@@ -1159,4 +1178,15 @@ end})
 
 -- ── Boot ────────────────────────────────────────────────────
 Rayfield:LoadConfiguration()
-notify("Helicity Hub v4","Loaded!  Select a tornado to start HUD.",5)
+notify("Helicity Hub v4","Loaded! Scanning for tornados...",4)
+
+-- ── Deferred startup scan (runs AFTER window is built, spread across frames) ──
+task.spawn(function()
+    task.wait(0.8) -- wait for Rayfield window to fully render
+    doTornadoScan(true)
+    if #tornadoList > 0 then
+        notify("Tornado List","Found "..#tornadoList.." tornado(s) — select one in the Tornado tab.",4)
+    else
+        notify("Tornado List","No tornados found yet.\nPress 🔄 Refresh when one spawns.",4)
+    end
+end)
