@@ -1,6 +1,9 @@
 local Rayfield = loadstring(game:HttpGet('https://sirius.menu/rayfield'))()
 
--- Risk Hierarchy Setup
+-- Configuration
+_G.AutoHop = false
+_G.TargetRisk = "High"
+
 local RiskHierarchy = {
     ["Find Storm"] = 1,
     ["Marginal"] = 2,
@@ -11,51 +14,26 @@ local RiskHierarchy = {
 }
 
 local Window = Rayfield:CreateWindow({
-   Name = "Helicity | Auto-Hunter",
-   LoadingTitle = "Atmospheric Re-Entry...",
+   Name = "Helicity | Risk Hunter",
+   LoadingTitle = "Scanning Atmosphere...",
    LoadingSubtitle = "by Pleq",
-   ConfigurationSaving = {
-      Enabled = true,
-      FolderName = "HelicityHunter",
-      FileName = "AutoConfig"
-   }
+   ConfigurationSaving = {Enabled = true, FolderName = "HelicityWeather"}
 })
 
 local MainTab = Window:CreateTab("Auto-Finder", 4483362458)
-local StatusLabel = MainTab:CreateLabel("Current Server Risk: Checking...")
 
--- Values to be saved
-_G.TargetRisk = "High"
-_G.AutoHopEnabled = false
-
-MainTab:CreateDropdown({
-   Name = "Target Risk Level",
-   Options = {"Find Storm", "Marginal", "Mild", "Enhanced", "Moderate", "High"},
-   CurrentOption = {"High"},
-   Flag = "TargetRisk", -- Used for config saving
-   Callback = function(Option)
-      _G.TargetRisk = Option[1]
-   end,
-})
-
-MainTab:CreateToggle({
-   Name = "Enable Auto-Search",
-   CurrentValue = false,
-   Flag = "AutoHopToggle", -- Used for config saving
-   Callback = function(Value)
-      _G.AutoHopEnabled = Value
-   end,
-})
-
--- Logic to read the game's risk UI
+-- Function to find the current risk level from the game UI
 local function GetCurrentRisk()
     local risk = "Unknown"
+    -- Attempt to find the risk text in the Helicity UI (Typical paths for this game)
     pcall(function()
+        -- This looks for the text inside the NWS/Outlook UI
         local gui = game:GetService("Players").LocalPlayer.PlayerGui
-        local hud = gui:FindFirstChild("MainUI", true) or gui:FindFirstChild("HUD", true)
+        local outlook = gui:FindFirstChild("MainUI", true) or gui:FindFirstChild("HUD", true)
         
-        for _, v in pairs(hud:GetDescendants()) do
-            if v:IsA("TextLabel") then
+        -- Helicity usually stores risk in a label. We scan for the keywords.
+        for _, v in pairs(outlook:GetDescendants()) do
+            if v:IsA("TextLabel") or v:IsA("TextBox") then
                 for riskName, _ in pairs(RiskHierarchy) do
                     if string.find(v.Text, riskName) then
                         risk = riskName
@@ -67,24 +45,44 @@ local function GetCurrentRisk()
     return risk
 end
 
--- The Loop
+local StatusLabel = MainTab:CreateLabel("Current Server Risk: Checking...")
+
+MainTab:CreateDropdown({
+   Name = "Target Risk Level",
+   Options = {"Find Storm", "Marginal", "Mild", "Enhanced", "Moderate", "High"},
+   CurrentOption = {"High"},
+   MultipleOptions = false,
+   Callback = function(Option)
+      _G.TargetRisk = Option[1]
+   end,
+})
+
+MainTab:CreateToggle({
+   Name = "Auto-Hop for Risk",
+   CurrentValue = false,
+   Callback = function(Value)
+      _G.AutoHop = Value
+   end,
+})
+
+-- The "Brain" of the script
 task.spawn(function()
-    -- Wait for game to load fully
-    if not game:IsLoaded() then game.Loaded:Wait() end
-    task.wait(5) -- Give the weather UI time to appear
-    
-    while true do
+    while task.wait(3) do
         local current = GetCurrentRisk()
         StatusLabel:Set("Current Server Risk: " .. current)
         
-        if _G.AutoHopEnabled then
+        if _G.AutoHop then
             local currentVal = RiskHierarchy[current] or 0
             local targetVal = RiskHierarchy[_G.TargetRisk] or 6
             
+            -- If current risk is lower than what you want, Hop!
             if currentVal < targetVal then
-                Rayfield:Notify({Title = "Scanning...", Content = "Risk too low ("..current.."). Hopping!", Duration = 3})
+                Rayfield:Notify({
+                   Title = "Risk Too Low",
+                   Content = "Found " .. current .. ", looking for " .. _G.TargetRisk .. ". Hopping...",
+                   Duration = 3
+                })
                 
-                -- Server Hop Logic
                 local HttpService = game:GetService("HttpService")
                 local TeleportService = game:GetService("TeleportService")
                 local Servers = HttpService:JSONDecode(game:HttpGet("https://games.roblox.com/v1/games/" .. game.PlaceId .. "/servers/Public?sortOrder=Desc&limit=100"))
@@ -95,14 +93,14 @@ task.spawn(function()
                         break
                     end
                 end
-                break -- Exit loop to prevent multiple teleports
             else
-                StatusLabel:Set("✅ TARGET FOUND: " .. current)
+                Rayfield:Notify({
+                   Title = "Target Found!",
+                   Content = "This server meets your " .. _G.TargetRisk .. " requirement!",
+                   Duration = 10
+                })
+                _G.AutoHop = false -- Stop hopping once found
             end
         end
-        task.wait(5)
     end
 end)
-
--- LOAD CONFIGURATION (This is the "Auto" part)
-Rayfield:LoadConfiguration()
